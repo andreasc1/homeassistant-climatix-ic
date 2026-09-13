@@ -118,3 +118,4 @@ cards:
         name: Humidity
       - entity: sensor.climatix_target_setpoint
         name: Target
+
