@@ -1,0 +1,9 @@
+{
+  "domain": "climatix_ic",
+  "name": "Siemens Climatix IC RDS110",
+  "codeowners": ["@andreas"],
+  "config_flow": true,
+  "documentation": "https://github.com/yourusername/homeassistant-climatix-ic",
+  "iot_class": "cloud_polling",
+  "version": "1.1.0"
+}

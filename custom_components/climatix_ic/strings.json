@@ -1,0 +1,18 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Siemens Climatix IC",
+        "description": "Enter your Siemens Climatix IC login credentials.",
+        "data": {
+          "username": "Email Address",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid username or password.",
+      "cannot_connect": "Failed to connect to Siemens Climatix IC server."
+    }
+  }
+}
