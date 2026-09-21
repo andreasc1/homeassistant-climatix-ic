@@ -1,182 +1,246 @@
-"""DataUpdateCoordinator for Climatix IC API."""
+"""DataUpdateCoordinator for the Siemens Climatix IC cloud API."""
 
-from datetime import timedelta
+from __future__ import annotations
+
+import asyncio
 import json
 import logging
-import requests
+from typing import Any
+
+import aiohttp
 
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
     UpdateFailed,
 )
 
 from .const import (
+    DATAPOINTS,
+    DATAPOINT_URL,
+    DEFAULT_SCAN_INTERVAL,
+    DEFAULT_MODEL,
     DOMAIN,
-    DP_HEATING_SWITCH,
-    DP_HUMIDITY,
-    DP_OPERATING_MODE,
-    DP_ROOM_TEMP,
-    DP_SETPOINT_OFFSET,
-    DP_TARGET_SETPOINT,
-    DP_WATER_SWITCH,
+    PLANTS_URL,
+    REQUEST_TIMEOUT,
     SUBSCRIPTION_KEY,
+    SUPPORTED_ASN,
+    TOKEN_URL,
+    VALUES_URL,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
-FALLBACK_PLANT_ID = "P55c454e2-d8ae-4f95-8991-d818d5c5d1b7"
+# suffix -> logical key, for decoding responses.
+_SUFFIX_TO_KEY = {suffix: key for key, suffix in DATAPOINTS.items()}
 
 
-class ClimatixDataUpdateCoordinator(DataUpdateCoordinator):
-  """Coordinator for fetching and discovering Climatix IC endpoints."""
+class ClimatixAuthError(Exception):
+    """Raised when the cloud rejects the credentials."""
 
-  def __init__(self, hass: HomeAssistant, username: str, password: str) -> None:
-    super().__init__(
-        hass,
-        _LOGGER,
-        name=DOMAIN,
-        update_interval=timedelta(seconds=15),  # Faster polling for testing
-    )
-    self.username = username
-    self.password = password
-    self.plant_id = None
-    self.token = None
-    self.headers = {}
 
-  def authenticate_and_discover(self) -> None:
-    """Authenticate and dynamically resolve Plant ID."""
-    url = "https://api.climatixic.com/Token"
-    headers = {
-        "Ocp-Apim-Subscription-Key": SUBSCRIPTION_KEY,
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Accept": "application/json, text/plain, */*",
-    }
-    payload = {
-        "grant_type": "password",
-        "username": self.username,
-        "password": self.password,
-    }
+class ClimatixApiError(Exception):
+    """Raised for connection or unexpected-response errors."""
 
-    res = requests.post(url, headers=headers, data=payload, timeout=12)
-    if res.status_code in (400, 401):
-      raise ConfigEntryAuthFailed("Invalid username or password")
-    res.raise_for_status()
 
-    data = res.json()
-    self.token = data.get("access_token") if isinstance(data, dict) else data
+class ClimatixDataUpdateCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
+    """Authenticate, discover plants, and poll datapoint values."""
 
-    self.headers = {
-        "Authorization": f"Bearer {self.token}",
-        "Ocp-Apim-Subscription-Key": SUBSCRIPTION_KEY,
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/plain, */*",
-    }
-
-    filter_param = json.dumps([
-        {"asn": "RDS110"},
-        {"asn": "RDS120"},
-        {"asn": "RDS110.R"},
-        {"asn": "RDS120.B"},
-        {"assigned": True},
-    ])
-    plants_url = f"https://api.climatixic.com/Plants?filterId={filter_param}&skip=0&take=100"
-
-    try:
-      plants_res = requests.get(plants_url, headers=self.headers, timeout=12)
-      plants_res.raise_for_status()
-      plants_data = plants_res.json()
-
-      plant_items = (
-          plants_data
-          if isinstance(plants_data, list)
-          else plants_data.get("plants", [])
-      )
-
-      if plant_items:
-        first = plant_items[0]
-        self.plant_id = (
-            first.get("id")
-            or first.get("plantId")
-            or first.get("asn")
-            or first.get("name")
+    def __init__(self, hass: HomeAssistant, username: str, password: str) -> None:
+        super().__init__(
+            hass,
+            _LOGGER,
+            name=DOMAIN,
+            update_interval=DEFAULT_SCAN_INTERVAL,
         )
-      else:
-        self.plant_id = FALLBACK_PLANT_ID
+        self._username = username
+        self._password = password
+        self._session = async_get_clientsession(hass)
+        self._token: str | None = None
+        # Populated by discovery; one entry per thermostat on the account.
+        self.plants: list[dict[str, Any]] = []
 
-    except Exception:
-      self.plant_id = FALLBACK_PLANT_ID
+    # ------------------------------------------------------------------ auth
 
-  async def _async_update_data(self) -> dict:
-    return await self.hass.async_add_executor_job(self._fetch_data)
+    @property
+    def _auth_headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self._token}",
+            "Ocp-Apim-Subscription-Key": SUBSCRIPTION_KEY,
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/plain, */*",
+        }
 
-  def _fetch_data(self) -> dict:
-    if not self.token or not self.plant_id:
-      self.authenticate_and_discover()
+    async def async_authenticate(self) -> None:
+        """Obtain an OAuth token. Raises ClimatixAuthError / ClimatixApiError."""
+        headers = {
+            "Ocp-Apim-Subscription-Key": SUBSCRIPTION_KEY,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json, text/plain, */*",
+        }
+        payload = {
+            "grant_type": "password",
+            "username": self._username,
+            "password": self._password,
+        }
+        try:
+            async with asyncio.timeout(REQUEST_TIMEOUT):
+                resp = await self._session.post(
+                    TOKEN_URL, headers=headers, data=payload
+                )
+                if resp.status in (400, 401):
+                    raise ClimatixAuthError("Invalid username or password")
+                if resp.status != 200:
+                    raise ClimatixApiError(f"Auth returned HTTP {resp.status}")
+                data = await resp.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            raise ClimatixApiError(f"Connection error during auth: {err}") from err
 
-    dp_suffixes = [
-        DP_TARGET_SETPOINT,
-        DP_SETPOINT_OFFSET,
-        DP_HUMIDITY,
-        DP_ROOM_TEMP,
-        DP_OPERATING_MODE,
-        DP_HEATING_SWITCH,
-        DP_WATER_SWITCH,
-    ]
-    filter_list = [f"{self.plant_id};{suffix}" for suffix in dp_suffixes]
-    endpoint = f"https://api.climatixic.com/DataPoints/Values?filterId={json.dumps(filter_list)}"
+        token = data.get("access_token") if isinstance(data, dict) else None
+        if not token:
+            raise ClimatixAuthError("No access token in response")
+        self._token = token
 
-    try:
-      res = requests.get(endpoint, headers=self.headers, timeout=12)
-      if res.status_code == 401:
-        self.authenticate_and_discover()
-        res = requests.get(endpoint, headers=self.headers, timeout=12)
-      res.raise_for_status()
-    except Exception as err:
-      raise UpdateFailed(f"Error communicating with Climatix IC API: {err}") from err
+    # -------------------------------------------------------------- requests
 
-    raw_data = res.json()
-    parsed = {}
-    values_dict = raw_data.get("values", {})
+    async def _api_get(
+        self, url: str, params: dict[str, str] | None = None, _retry: bool = True
+    ) -> Any:
+        """GET with a single transparent re-auth on 401."""
+        if not self._token:
+            await self.async_authenticate()
+        try:
+            async with asyncio.timeout(REQUEST_TIMEOUT):
+                resp = await self._session.get(
+                    url, headers=self._auth_headers, params=params
+                )
+                if resp.status == 401 and _retry:
+                    self._token = None
+                    return await self._api_get(url, params=params, _retry=False)
+                if resp.status != 200:
+                    text = await resp.text()
+                    raise ClimatixApiError(
+                        f"GET {url} returned HTTP {resp.status}: {text[:200]}"
+                    )
+                return await resp.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            raise ClimatixApiError(f"Connection error: {err}") from err
 
-    for dp_id, dp_data in values_dict.items():
-      inner = dp_data.get("value", {})
-      val = inner.get("value") if isinstance(inner, dict) else inner
-      if isinstance(val, float):
-        val = round(val, 2)
+    async def async_discover_plants(self) -> None:
+        """Resolve every RDS thermostat on the account. Never falls back."""
+        filter_param = json.dumps(
+            [{"asn": asn} for asn in SUPPORTED_ASN] + [{"assigned": True}]
+        )
+        data = await self._api_get(
+            PLANTS_URL,
+            params={"filterId": filter_param, "skip": "0", "take": "100"},
+        )
 
-      if DP_TARGET_SETPOINT in dp_id:
-        parsed["target_setpoint"] = val
-      elif DP_SETPOINT_OFFSET in dp_id:
-        parsed["setpoint_offset"] = val
-      elif DP_HUMIDITY in dp_id:
-        parsed["humidity"] = val
-      elif DP_ROOM_TEMP in dp_id:
-        parsed["room_temperature"] = val
-      elif DP_OPERATING_MODE in dp_id:
-        parsed["operating_mode"] = val
-      elif DP_HEATING_SWITCH in dp_id:
-        parsed["heating_switch"] = val
-      elif DP_WATER_SWITCH in dp_id:
-        parsed["water_switch"] = val
+        items: list[Any] = []
+        if isinstance(data, dict):
+            items = data.get("items") or data.get("plants") or []
+        elif isinstance(data, list):
+            items = data
 
-    return parsed
+        plants: list[dict[str, Any]] = []
+        for rec in items:
+            if not isinstance(rec, dict):
+                continue
+            plant_id = rec.get("id") or rec.get("plantId")
+            if not plant_id:
+                continue
+            plants.append(
+                {
+                    "id": plant_id,
+                    "name": rec.get("name") or rec.get("serialNumber") or plant_id,
+                    "model": rec.get("asn") or DEFAULT_MODEL,
+                    "serial": rec.get("serialNumber"),
+                    "city": rec.get("city") or "",
+                    "sw_version": rec.get("bspVersion") or None,
+                }
+            )
 
-  def set_datapoint(self, dp_suffix: str, value: float) -> None:
-    if not self.token or not self.plant_id:
-      self.authenticate_and_discover()
+        if not plants:
+            # No device on the account (or the account is not an RDS account).
+            raise ClimatixApiError("No RDS thermostats found on this account")
 
-    dp_id = f"{self.plant_id};{dp_suffix}"
-    endpoint = f"https://api.climatixic.com/DataPoints/{dp_id}"
-    payload = {"value": value}
+        self.plants = plants
 
-    res = requests.put(
-        endpoint, headers=self.headers, json=payload, timeout=12
-    )
-    if res.status_code == 401:
-      self.authenticate_and_discover()
-      res = requests.put(
-          endpoint, headers=self.headers, json=payload, timeout=12
-      )
-    res.raise_for_status()
+    async def async_set_value(
+        self, plant_id: str, suffix: str, value: float | int
+    ) -> None:
+        """Write a datapoint, with a single re-auth on 401."""
+        if not self._token:
+            await self.async_authenticate()
+        url = f"{DATAPOINT_URL}/{plant_id};{suffix}"
+        payload = {"value": value}
+        try:
+            async with asyncio.timeout(REQUEST_TIMEOUT):
+                resp = await self._session.put(
+                    url, headers=self._auth_headers, json=payload
+                )
+                if resp.status == 401:
+                    self._token = None
+                    await self.async_authenticate()
+                    resp = await self._session.put(
+                        url, headers=self._auth_headers, json=payload
+                    )
+                if resp.status not in (200, 204):
+                    text = await resp.text()
+                    raise ClimatixApiError(
+                        f"PUT {url} returned HTTP {resp.status}: {text[:200]}"
+                    )
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            raise ClimatixApiError(f"Error writing datapoint: {err}") from err
+
+    # --------------------------------------------------------------- polling
+
+    async def _async_update_data(self) -> dict[str, dict[str, Any]]:
+        try:
+            if not self._token:
+                await self.async_authenticate()
+            if not self.plants:
+                await self.async_discover_plants()
+
+            full_ids = [
+                f"{plant['id']};{suffix}"
+                for plant in self.plants
+                for suffix in DATAPOINTS.values()
+            ]
+            raw = await self._api_get(
+                VALUES_URL, params={"filterId": json.dumps(full_ids)}
+            )
+        except ClimatixAuthError as err:
+            raise ConfigEntryAuthFailed(str(err)) from err
+        except ClimatixApiError as err:
+            raise UpdateFailed(str(err)) from err
+
+        values = raw.get("values", {}) if isinstance(raw, dict) else {}
+        result: dict[str, dict[str, Any]] = {
+            plant["id"]: {"_bounds": {}} for plant in self.plants
+        }
+
+        for full_id, entry in values.items():
+            if ";" not in full_id:
+                continue
+            plant_id, suffix = full_id.split(";", 1)
+            key = _SUFFIX_TO_KEY.get(suffix)
+            if key is None or plant_id not in result:
+                continue
+
+            inner = entry.get("value") if isinstance(entry, dict) else entry
+            if isinstance(inner, dict):
+                val = inner.get("value")
+                lo, hi = inner.get("minValue"), inner.get("maxValue")
+                if lo is not None and hi is not None:
+                    result[plant_id]["_bounds"][key] = (lo, hi)
+            else:
+                val = inner
+
+            if isinstance(val, float):
+                val = round(val, 2)
+            result[plant_id][key] = val
+
+        return result
