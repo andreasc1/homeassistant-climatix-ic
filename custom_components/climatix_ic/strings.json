@@ -8,11 +8,23 @@
           "username": "Email Address",
           "password": "Password"
         }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate Siemens Climatix IC",
+        "description": "Enter the current password for {username}.",
+        "data": {
+          "password": "Password"
+        }
       }
     },
     "error": {
       "invalid_auth": "Invalid username or password.",
-      "cannot_connect": "Failed to connect to Siemens Climatix IC server."
+      "cannot_connect": "Failed to connect to the Siemens Climatix IC server.",
+      "unknown": "An unexpected error occurred."
+    },
+    "abort": {
+      "already_configured": "This account is already configured.",
+      "reauth_successful": "Re-authentication was successful."
     }
   }
 }
