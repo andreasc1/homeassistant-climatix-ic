@@ -11,6 +11,14 @@ A custom Home Assistant integration for the **Siemens RDS110 Smart Thermostat**,
 
 ---
 
+## 🚀 Quick Install via HACS
+
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=andreasc1&repository=homeassistant-climatix-ic&category=integration)
+
+Click the badge to add this repository to your HACS custom repositories. Then open the **Siemens Climatix IC** card, click **Download**, and restart Home Assistant. Prefer to do it by hand? See [Installation](#️-installation) below.
+
+---
+
 ## ✨ Features
 
 - **Climate entity** (`climate.climatix_thermostat`)
@@ -143,7 +151,7 @@ The integration authenticates against the Climatix IC cloud, discovers the RDS t
 
 ## 🙏 Credits
 
-The Climatix IC cloud API behaviour was informed by the openHAB [`siemensrds`](https://www.openhab.org/addons/bindings/siemensrds/) binding.
+The Climatix IC cloud API behaviour was informed by the excellent openHAB [`siemensrds`](https://www.openhab.org/addons/bindings/siemensrds/) binding.
 
 ---
 
